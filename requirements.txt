@@ -1,0 +1,21 @@
+# Core dependencies
+streamlit>=1.28.0
+transformers>=4.34.0
+torch>=2.1.0
+langchain>=0.0.310
+
+# PDF Processing
+pdfminer.six>=20221105
+
+# Embeddings and Vector Store
+sentence-transformers>=2.2.2
+chromadb>=0.4.13
+duckdb>=0.9.1
+pyarrow>=14.0.1  # Required for Parquet support
+
+# UI Components
+streamlit-chat>=0.1.1
+
+# Optional: GPU Support (uncomment if using CUDA)
+# nvidia-cuda-runtime-cu12
+# nvidia-cuda-toolkit
