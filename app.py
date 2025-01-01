@@ -1,211 +1,155 @@
-import os 
-import chromadb
-from chromadb.config import Settings
 import streamlit as st 
+import os
 import base64
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLML, pipeline
+import time
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM 
+from transformers import pipeline
 import torch 
-from langchain.document_loaders import PDFMinerLoader 
+import textwrap 
+from langchain.document_loaders import PyPDFLoader, DirectoryLoader, PDFMinerLoader 
 from langchain.text_splitter import RecursiveCharacterTextSplitter 
 from langchain.embeddings import SentenceTransformerEmbeddings 
 from langchain.vectorstores import Chroma 
 from langchain.llms import HuggingFacePipeline
 from langchain.chains import RetrievalQA 
+from const import CHROMA_SETTINGS
 from streamlit_chat import message
 
-# ChromaDB Settings
-CHROMA_SETTINGS = Settings(
-    chroma_db_impl='duckdb+parquet',
-    persist_directory='db',
-    anonymized_telemetry=False
+st.set_page_config(layout="wide")
+device = torch.device('cpu')
+
+checkpoint = "MBZUAI/LaMini-T5-738M"
+print(f"Checkpoint path: {checkpoint}")
+tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+base_model = AutoModelForSeq2SeqLM.from_pretrained(
+    checkpoint,
+    device_map=device,
+    torch_dtype=torch.float32
 )
 
-# Initialize persistent directory
-PERSIST_DIRECTORY = os.path.join(os.getcwd(), 'db')
-if not os.path.exists(PERSIST_DIRECTORY):
-    os.makedirs(PERSIST_DIRECTORY)
-
-# Page configuration and styling
-st.set_page_config(
-    page_title="PDF Chat Assistant",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-# Custom CSS for better UI
-st.markdown("""
-    <style>
-    .stApp {
-        max-width: 1200px;
-        margin: 0 auto;
-    }
-    .chat-container {
-        border-radius: 10px;
-        padding: 20px;
-        background-color: #f5f5f5;
-    }
-    .user-input {
-        border-radius: 20px;
-        border: 2px solid #4CAF50;
-    }
-    .file-uploader {
-        border: 2px dashed #4CAF50;
-        border-radius: 10px;
-        padding: 20px;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-# Initialize device and model configurations
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-CHECKPOINT = "MBZUAI/LaMini-T5-738M"
-PERSIST_DIR = "db"
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+persist_directory = "db"
 
 @st.cache_resource
-def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        CHECKPOINT,
-        device_map=device,
-        torch_dtype=torch.float32
-    )
-    return tokenizer, model
-
-@st.cache_resource
-def initialize_chroma_client():
-    return chromadb.Client(Settings(
-        chroma_db_impl='duckdb+parquet',
-        persist_directory=PERSIST_DIRECTORY,
-        anonymized_telemetry=False
-    ))
-
-@st.cache_resource
-def process_pdf(file_path):
-    loader = PDFMinerLoader(file_path)
+def data_ingestion():
+    for root, dirs, files in os.walk("docs"):
+        for file in files:
+            if file.endswith(".pdf"):
+                print(file)
+                loader = PDFMinerLoader(os.path.join(root, file))
     documents = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
-    )
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=500)
     texts = text_splitter.split_documents(documents)
     
     embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
     
-    # Initialize ChromaDB with proper settings
-    db = Chroma.from_documents(
-        documents=texts,
-        embedding=embeddings,
-        client_settings=CHROMA_SETTINGS,
-        persist_directory=PERSIST_DIRECTORY
-    )
-    
-    # Ensure persistence
+    db = Chroma.from_documents(texts, embeddings, persist_directory=persist_directory, client_settings=CHROMA_SETTINGS)
     db.persist()
-    return db
+    db=None 
 
 @st.cache_resource
-def setup_qa_chain():
-    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-    
-    # Initialize ChromaDB with existing data
-    db = Chroma(
-        persist_directory=PERSIST_DIRECTORY,
-        embedding_function=embeddings,
-        client_settings=CHROMA_SETTINGS
-    )
-    
-    # Initialize the language model and QA chain
-    tokenizer, model = load_model()
+def llm_pipeline():
     pipe = pipeline(
         'text2text-generation',
-        model=model,
-        tokenizer=tokenizer,
-        max_length=256,
-        do_sample=True,
-        temperature=0.3,
-        top_p=0.95,
+        model = base_model,
+        tokenizer = tokenizer,
+        max_length = 256,
+        do_sample = True,
+        temperature = 0.3,
+        top_p= 0.95,
         device=device
     )
-    
     local_llm = HuggingFacePipeline(pipeline=pipe)
-    
-    return RetrievalQA.from_chain_type(
-        llm=local_llm,
-        chain_type="stuff",
-        retriever=db.as_retriever(
-            search_kwargs={"k": 3}  # Retrieve top 3 most relevant chunks
-        ),
+    return local_llm
+
+@st.cache_resource
+def qa_llm():
+    llm = llm_pipeline()
+    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    db = Chroma(persist_directory="db", embedding_function = embeddings, client_settings=CHROMA_SETTINGS)
+    retriever = db.as_retriever()
+    qa = RetrievalQA.from_chain_type(
+        llm = llm,
+        chain_type = "stuff",
+        retriever = retriever,
         return_source_documents=True
     )
+    return qa
 
-def cleanup_db():
-    """Cleanup function to properly close DuckDB connections"""
-    try:
-        client = initialize_chroma_client()
-        client.reset()
-    except Exception as e:
-        st.error(f"Error during cleanup: {str(e)}")
+def process_answer(instruction):
+    response = ''
+    instruction = instruction
+    qa = qa_llm()
+    generated_text = qa(instruction)
+    answer = generated_text['result']
+    return answer
 
-def display_pdf(file_path):
-    with open(file_path, "rb") as f:
+def get_file_size(file):
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+    return file_size
+
+@st.cache_data
+def displayPDF(file):
+    with open(file, "rb") as f:
         base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
+
+    pdf_display = F'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
     st.markdown(pdf_display, unsafe_allow_html=True)
 
-def display_chat_history(history):
-    with st.container():
-        for i, (past, generated) in enumerate(zip(history["past"], history["generated"])):
-            message(past, is_user=True, key=f"{i}_user")
-            message(generated, key=str(i))
+def display_conversation(history):
+    for i in range(len(history["generated"])):
+        message(history["past"][i], is_user=True, key=str(i) + "_user")
+        message(history["generated"][i],key=str(i))
 
 def main():
-    st.title("📚 PDF Chat Assistant")
-    st.markdown("### Upload your PDF and start chatting!")
+    st.markdown("<h1 style='text-align: center; color: #4CAF50;'>Chat and Summarize Your PDF Effortlessly</h1>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center; color: #757575;'>Created with ❤️ by <a href='https://github.com/UNES97'>UNES97</a></h3>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center; color:#FF6347;'>Upload Your PDF to Get Started</h2>", unsafe_allow_html=True)
 
-    uploaded_file = st.file_uploader("", type=["pdf"], key="pdf_uploader")
+    uploaded_file = st.file_uploader("", type=["pdf"])
 
-    try:
-        if uploaded_file:
-            file_path = os.path.join("docs", uploaded_file.name)
-            with open(file_path, "wb") as f:
-                f.write(uploaded_file.getvalue())
+    if uploaded_file is not None:
+        file_details = {
+            "Filename": uploaded_file.name,
+            "File size": get_file_size(uploaded_file)
+        }
+        filepath = "docs/"+uploaded_file.name
+        with open(filepath, "wb") as temp_file:
+                temp_file.write(uploaded_file.read())
 
-            col1, col2 = st.columns([1, 2])
-            
-            with col1:
-                st.markdown("### PDF Preview")
-                display_pdf(file_path)
+        col1, col2= st.columns([1,2])
+        with col1:
+            st.markdown("<h4 style color:black;'>File details</h4>", unsafe_allow_html=True)
+            st.json(file_details)
+            st.markdown("<h4 style color:black;'>File preview</h4>", unsafe_allow_html=True)
+            pdf_view = displayPDF(filepath)
 
-            with col2:
-                with st.spinner('Processing PDF...'):
-                    qa_chain = setup_qa_chain()
+        with col2:
+            with st.spinner('Embeddings are in process...'):
+                ingested_data = data_ingestion()
+            st.success('Embeddings are created successfully!')
+            st.markdown("<h4 style color:black;'>Chat Here</h4>", unsafe_allow_html=True)
+
+            user_input = st.text_input("", key="input")
+
+            # Initialize session state for generated responses and past messages
+            if "generated" not in st.session_state:
+                st.session_state["generated"] = ["I am ready to help you"]
+            if "past" not in st.session_state:
+                st.session_state["past"] = ["Hey there!"]
                 
-                st.markdown("### Chat")
-                if "chat_history" not in st.session_state:
-                    st.session_state.chat_history = {
-                        "generated": ["Hello! How can I help you with the document?"],
-                        "past": ["Hi!"]
-                    }
+            # Search the database for a response based on user input and update session state
+            if user_input:
+                answer = process_answer({'query': user_input})
+                st.session_state["past"].append(user_input)
+                response = answer
+                st.session_state["generated"].append(response)
 
-                user_input = st.text_input("Ask a question:", key="user_input", 
-                                        placeholder="Type your question here...")
-
-                if user_input:
-                    with st.spinner('Thinking...'):
-                        response = qa_chain({"query": user_input})
-                        st.session_state.chat_history["past"].append(user_input)
-                        st.session_state.chat_history["generated"].append(response["result"])
-
-                display_chat_history(st.session_state.chat_history)
-        pass
-    finally:
-        cleanup_db()
-
-import atexit
-atexit.register(cleanup_db)
+            # Display conversation history using Streamlit messages
+            if st.session_state["generated"]:
+                display_conversation(st.session_state)
+        
 
 if __name__ == "__main__":
     main()
